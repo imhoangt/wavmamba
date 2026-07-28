@@ -1,0 +1,336 @@
+# wavmamba — WavMamba for WiFi-CSI HAR (UT-HAR & NTU-Fi)
+
+Public code accompanying the paper. Trains **WavMamba** — a multi-branch
+(one branch per Haar DWT subband) CNN + bidirectional-Mamba model with adaptive
+late fusion — for WiFi-CSI human activity recognition on **UT-HAR** and
+**NTU-Fi**.
+
+The architecture is **fixed** to the configuration reported in the paper:
+
+| Flag | Value |
+|------|-------|
+| `subbands`   | `('HL', 'LH')`  — Haar 2-branch (no LL) |
+| `pool`       | `attnstat`      — attentive statistics pooling |
+| `stem_norm`  | `False`         — no GroupNorm in the stem |
+| `fusion`     | `gate`          — per-channel softmax branch gate |
+
+Only the dataset-dependent dimensions (`num_classes`, `n_antennas`, `f2`) and
+four width knobs (`d_model`, `d_stem`, `d_state`, `n_mamba_layers`) are
+configurable; any attempt to change a fixed flag raises `ValueError`.
+
+## Requirements
+
+- Python 3.10+
+- CUDA GPU (the Mamba SSM kernels are CUDA-only)
+- See `requirements.txt` for the regular Python dependency list:
+  - `torch` (2.7+), `numpy`, `scipy`, `pywavelets`, `scikit-learn`, `tqdm`,
+    `matplotlib`
+- Install `mamba-ssm` and `causal-conv1d` manually as described below because
+  their CUDA wheels must match the torch/CUDA/C++ ABI.
+
+## Install
+
+`mamba-ssm` and `causal-conv1d` ship prebuilt CUDA wheels that must match the
+torch C++ ABI. With torch 2.7+ from PyPI (`cxx11abi=TRUE`), install the matching
+`...cxx11abiTRUE` wheels with `--no-deps` so pip does not re-resolve torch or
+replace an ABI-compatible wheel:
+
+```bash
+pip install torch==2.7.0
+pip install mamba-ssm --no-build-isolation --no-deps
+pip install causal-conv1d --no-deps
+pip install -r requirements.txt
+```
+
+`mamba-ssm` and `causal-conv1d` are intentionally **not** listed in
+`requirements.txt`; installing them through `pip install -r requirements.txt`
+can trigger dependency re-resolution and hard-to-debug CUDA/ABI failures.
+
+> Do **not** build `mamba-ssm` from source unless you have matched the exact
+> CUDA/torch ABI — the prebuilt wheels are the reliable path.
+
+## Layout
+
+```
+wavmamba/                       repository root
+├── wavmamba/                   importable package (the library)
+│   ├── __init__.py             public API re-exports
+│   ├── __main__.py             command line: python -m wavmamba build | train | ablate
+│   ├── model.py                WavMamba (fixed paper configuration)
+│   ├── data.py                 raw loaders -> Haar DWT -> bench build -> DataLoaders
+│   ├── config.py               TrainCfg — the paper training protocol
+│   ├── engine.py               train/eval primitives + analytic MAC counting
+│   ├── trainer.py              run() — seed loop -> eval -> plots -> metrics.json
+│   └── ablation.py             AblationWavMamba + registry (single-variable study)
+├── tests/
+│   ├── smoke_cpu.py            CPU end-to-end smoke test (mocked Mamba)
+│   └── smoke_ablation.py       CPU ablation smoke test (all variants + ours==WavMamba)
+├── notebooks/
+│   └── wavmamba_kaggle.ipynb   Kaggle companion notebook
+├── README.md
+├── LICENSE
+└── requirements.txt
+```
+
+The package holds all logic; `__main__.py` only parses arguments and calls into
+it. The CLI examples below assume you run from the repository root:
+
+```bash
+cd wavmamba
+```
+
+## Datasets
+
+Expected local layout by default:
+
+```
+dataset/
+├── UT_HAR/
+│   ├── X_train.csv
+│   ├── X_test.csv
+│   ├── X_val.csv
+│   ├── y_train.csv
+│   ├── y_test.csv
+│   └── y_val.csv
+└── NTU-Fi_HAR/
+    ├── train_amp/
+    └── test_amp/
+```
+
+You can also keep the data anywhere and pass `--raw-root <path>`; the loaders
+recursively search for the expected marker files/folders (`X_train.csv` for
+UT-HAR and `train_amp/` for NTU-Fi), which also works with Kaggle dataset mounts.
+
+| Dataset | Classes | n_ant x sub | fs | Split |
+|---------|---------|-------------|----|-------|
+| UT-HAR  | 7 | 3 x 30  | 100 Hz | official train=X_train / test=X_test+X_val merged (default; `--no-merge-val` keeps test=X_test) |
+| NTU-Fi  | 6 | 3 x 114 | 500 Hz | official train_amp / test_amp (time downsampled 2000->500) |
+
+Raw CSI amplitude -> 2-D Haar DWT -> packed `[HL | LH]` subband-major input
+`(B, 2*n_antennas, T2, F2)`.
+
+Before public release, replace the dataset placeholders in the Citation /
+Provenance section with the official dataset URLs and license/citation notes
+required by the dataset providers.
+
+## Normalization — two orthogonal flags
+
+Normalization is split into two independent stages, controlled by `PRENORM`
+and `Z_GRAN`. z-norm after the DWT is **always applied**; the flags only choose
+the scheme:
+
+| Flag | Values | Meaning |
+|------|--------|---------|
+| `PRENORM` | `sensefi` \| `none` | Pre-norm on raw amplitude **before** the DWT. `sensefi` = UT-HAR min-max (per split) / NTU-Fi `(x-42.32)/4.98`. `none` = no raw pre-normalization. |
+| `Z_GRAN`  | `perpos` \| `pcb`    | Granularity of z-norm **after** the DWT. `perpos` = per-position `(C,T2,F2)`. `pcb` = per-channel-bin `(C,F2)`, collapsing time. |
+
+Four combinations:
+
+| Combination | Meaning |
+|-------------|---------|
+| `sensefi + pcb`    | raw pre-norm + per-channel-bin z statistics **(default — paper protocol)** |
+| `sensefi + perpos` | raw pre-norm + per-position z statistics |
+| `none + pcb`       | no raw pre-norm + per-channel-bin z statistics |
+| `none + perpos`    | no raw pre-norm + per-position z statistics |
+
+Every distinct build writes to its own bench dir
+`bench/<prenorm>_<z_gran>[_mv]/`, so builds never overwrite each other. The
+`_mv` suffix marks a UT-HAR merged-val build (the default), which changes the
+test split.
+`wavmamba/data.py::bench_dirname()` is the single source of truth for that
+name and is used by `build_bench()`, the `train` command and the notebook
+alike.
+
+**Protocol note.** For exact reproduction of the reported protocol, the DWT
+z-normalization statistics are computed over all official split samples in the
+bench build (`train + test`, including UT-HAR `val` under the default merged
+split). The loader applies those stored statistics to every split. This
+all-reps protocol is kept intentionally so the public code matches the reported
+preprocessing; it is not presented as a generic train-only normalization
+recipe.
+
+## Usage
+
+### CLI (primary entry point)
+
+All commands below assume:
+
+```bash
+cd wavmamba
+```
+
+Build the bench arrays, then train. The defaults reproduce the paper protocol
+(`--prenorm sensefi --z-gran pcb`, UT-HAR test = X_test + X_val, single seed
+42), so the bare commands are the reproduction commands:
+
+```bash
+# UT-HAR (paper protocol: sensefi pre-norm, per-channel-bin z, merged test split)
+python -m wavmamba build --dataset uthar
+python -m wavmamba train --dataset uthar
+
+# NTU-Fi (paper protocol)
+python -m wavmamba build --dataset ntufi
+python -m wavmamba train --dataset ntufi
+```
+
+The normalization variants are still available explicitly, e.g. no raw
+pre-norm + per-position z:
+
+```bash
+python -m wavmamba train --dataset ntufi --prenorm none --z-gran perpos
+```
+
+`python -m wavmamba train --help` lists all options (`--seeds`, `--num-epochs`,
+`--batch-size`, `--lr`, `--num-workers`, `--raw-root`, `--out-root`,
+`--no-merge-val`, `--no-build`, `--bench-dir`). By default `train` builds the
+bench first, then trains; pass `--no-build` or `--bench-dir <path>` to reuse an
+existing build.
+
+Whenever an existing bench is reused (`--no-build` or `--bench-dir`), the
+`train` command reads `stats.json` from that bench and fails if the CLI
+dataset/normalization/merge-val labels disagree with the bench metadata, so
+results can never be filed under a mismatched tag.
+
+### Python API
+
+The same two steps from Python (useful in notebooks). `build_bench()` defaults
+match the CLI (paper protocol):
+
+```python
+from wavmamba import build_bench, default_cfg, run
+
+build_bench('uthar', raw_root=RAW, out_root=OUT)
+run(bench_dir=BENCH, output_dir=OUT_DIR, cfg=default_cfg())  # single seed 42
+```
+
+For the 5-seed statistics reported in the paper, pass
+`cfg=default_cfg(seeds=(0, 4, 8, 17, 42))` (CLI: `--seeds 0,4,8,17,42`).
+
+`run()` reads the class count, class names and input dimensions from the bench's
+own `stats.json`, so they can never disagree with the data.
+
+Output goes to `<out_root>/outputs/wavmamba_<ds>_<prenorm>_<z_gran>[_mv]/`:
+
+```
+metrics.json                     config + per_seed + summary (acc, f1, CM, efficiency)
+seeds/<seed:03d>/
+    training_log.csv             per-epoch loss / test acc / macro-F1 / timings
+    last_model.pt                the reported model (final epoch) — only checkpoint kept
+    test_predictions.npz         predictions, probabilities, labels
+    training_curve.png           this seed's loss + test-accuracy curve
+    confusion_matrix.png         this seed's normalized confusion matrix
+plots/                           cross-seed aggregate — only when len(seeds) > 1
+    training_curve.png           all seeds overlaid
+    confusion_matrix.png         seed-averaged
+```
+
+Every seed gets its own figures. `plots/` is the aggregate across seeds, so it is
+written only for multi-seed runs (with one seed it would duplicate `seeds/<seed>/`).
+
+Only the final epoch's weights are saved. `per_seed.best_epoch` /
+`best_test_acc` in `metrics.json` are train-time diagnostics computed from the
+per-epoch test curve; no checkpoint is selected by them, and they must not be
+used as headline results.
+
+`summary` reports efficiency at batch size 1: `params_M`, `macs_M`, `flops_M`
+(= 2 × MACs), `macs_breakdown_M` per component, and `macs_note` stating the
+counting convention. MACs are counted analytically by `wavmamba/engine.py`,
+not by a tracer: Mamba's fast path hides its projections and the selective scan
+inside a custom autograd Function, where operator-matching counters such as
+`fvcore` silently see nothing — about 72% of this model's MACs. `latency_*_ms` is
+measured on GPU (200 timed runs after 50 warm-ups) and is `null` on CPU.
+
+`macs_ssm_counted` is `true` only when real Mamba blocks were found and counted
+in closed form. It is `false` on a CPU run that substitutes Mamba (as the smoke
+test does), where the number covers the convolutional path only.
+
+## Ablation study
+
+WavMamba ships a locked architecture, so the ablations live in a separate,
+configurable assembler (`wavmamba/ablation.py`) that reuses the same building
+blocks under swappable flags — the paper model and its reproducibility guarantee
+are untouched. Each variant changes exactly **one** component versus the paper
+configuration (`ours`):
+
+| # | Component | Variants (`ours` in bold) |
+|---|-----------|---------------------------|
+| 1 | Front-end       | `a1_raw` (no DWT, raw amplitude) · **dwt (HL+LH)** |
+| 2 | Branch structure| `a2_shared` (one shared branch) · **separate per-subband** |
+| 3 | CNN stem        | `a3_nostem` (DWT → embed → Mamba) · **stem + 3× TFBlock** |
+| 4 | Backbone        | `a4_bilstm` · `a4_unimamba` · **bidirectional Mamba** |
+| 5 | fwd/bwd merge   | `a5_add` ((f+b)/2) · `a5_concat` · **per-channel gate** |
+| 6 | Branch fusion   | `a6_mean` · `a6_concat` · **adaptive gate** |
+| 7 | Pooling         | `a7_mean` · **attentive statistics** |
+
+Run the whole sweep (single seed 42 by default), or a subset:
+
+```bash
+python -m wavmamba ablate --dataset uthar                       # all 11 variants
+python -m wavmamba ablate --dataset uthar --variants ours,a1_raw,a4_bilstm
+python -m wavmamba ablate --dataset uthar --seeds 0,4,8,17,42    # 5-seed table
+```
+
+Each variant builds the bench it needs (the DWT bench, or a separate `raw_…`
+bench for `a1_raw`), trains under the fixed protocol, and is filed under
+`outputs/ablation/<dataset>/<variant>/` with its own `metrics.json`. Finished
+variants are skipped, so the sweep is resumable. After the sweep the command
+prints a markdown table (acc, macro-F1, params, MACs per row); regenerate it any
+time with `ablation_table('uthar')`, which rediscovers runs by disk-glob so it
+survives a kernel restart. No parameter matching is applied — params and MACs
+are reported as table columns instead, so the compute difference of each variant
+is explicit.
+
+### Kaggle notebook (companion)
+
+`notebooks/wavmamba_kaggle.ipynb` runs both datasets end-to-end on Kaggle: clone
+the repo, install the dependencies, set `PRENORM`/`Z_GRAN`/`MERGE_VAL`/`SEEDS`,
+and run all cells. Before public release, replace `REPO_URL` in the notebook
+with the final public repository URL; optionally set `REPO_REF` to the paper
+release tag.
+
+## Training protocol (fixed)
+
+`config.py` ships a single protocol:
+
+| | |
+|---|---|
+| Optimizer  | AdamW, lr=5e-4, betas=(0.9, 0.95), wd=1e-3 |
+| Scheduler  | warmup_cosine, warmup=5 epochs, floor_lr=1e-6 |
+| Epochs     | 30, batch_size=32, grad_clip=1.0 |
+| Loss       | CrossEntropy (fixed — not configurable) |
+| WD exclude | norm/bias/A_log/D excluded from weight decay |
+| Seeds      | 42 by default; paper 5-seed protocol: (0, 4, 8, 17, 42) |
+
+Seeds are fixed for statistical reproducibility, but training is not bitwise
+deterministic by default: cuDNN benchmarking and TF32 matmul are enabled for
+speed, and CUDA kernel versions can change exact trajectories.
+
+## Citation / provenance
+
+If you use this code, cite the accompanying WavMamba paper. Replace this block
+with the final BibTeX before public release:
+
+```bibtex
+@article{wavmamba2026,
+  title  = {WavMamba: Wavelet-Guided Bidirectional Mamba for WiFi-CSI Human Activity Recognition},
+  author = {<authors>},
+  year   = {2026},
+  note   = {Code: https://github.com/<owner>/wavmamba}
+}
+```
+
+Dataset and preprocessing provenance to fill with final official links before
+release:
+
+- UT-HAR: add official dataset URL, citation, and license/usage terms.
+- NTU-Fi: add official dataset URL, citation, and license/usage terms.
+- The raw pre-normalization option `sensefi` follows the public benchmark-style
+  preprocessing used for these WiFi-CSI datasets: UT-HAR split-wise min-max and
+  NTU-Fi fixed `(x - 42.3199) / 4.9802` scaling.
+- `perpos` and `pcb` name the two z-stat granularities used in the experiments;
+  the implementation documents their shapes directly so the code remains
+  understandable without relying on prior-work labels.
+
+## License
+
+This package is released under the MIT License; see `LICENSE`.

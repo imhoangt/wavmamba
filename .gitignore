@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Build outputs (bench arrays, trained models, metrics, plots)
+outputs/
+bench/
+*.npy
+*.npz
+*.pt
+*.pth
+*.csv
+
+# Test scratch dirs (fixtures + runs created by tests/smoke_cpu.py + smoke_ablation.py)
+tests/_tmp*/
+tests/_cli*/
+tests/_e2e_tmp/
+
+# Packaging / generated docs
+build/
+dist/
+_build/
+
+# Datasets (download separately; see README)
+dataset/
+UT_HAR/
+NTU-Fi_HAR/
+
+# Reference papers (third-party PDFs — not redistributable)
+paper/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/

@@ -1,0 +1,24 @@
+# WavMamba — WiFi-CSI HAR (UT-HAR & NTU-Fi)
+# Python 3.10+, CUDA GPU required (mamba-ssm kernels are CUDA-only).
+#
+# IMPORTANT: install mamba-ssm / causal-conv1d FIRST with matching torch ABI:
+#   pip install torch==2.7.0
+#   pip install mamba-ssm --no-build-isolation --no-deps
+#   pip install causal-conv1d --no-deps
+# then install the regular Python dependencies:
+#   pip install -r requirements.txt
+#
+# mamba-ssm and causal-conv1d are intentionally not listed here; installing
+# them through requirements.txt can make pip re-resolve ABI-sensitive CUDA deps.
+
+torch>=2.7
+numpy>=1.24
+scipy>=1.10
+pywavelets>=1.4
+scikit-learn>=1.3
+tqdm>=4.65
+matplotlib>=3.7
+
+# No FLOP-counting dependency: operator-level counters (fvcore, FlopCounterMode)
+# cannot see Mamba's fast path, so MACs are counted analytically in
+# wavmamba/engine.py instead.
