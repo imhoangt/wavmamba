@@ -19,17 +19,22 @@ rung), trains an AblationWavMamba under the same protocol, and files each result
 under outputs/<subdir>/<dataset>/<variant>/. Finished runs are skipped, so the
 sweep is resumable; `ablation_table()` then aggregates them by disk-glob.
 
-`--study` picks the registry: `a` (default) is the paper ladder centred on the
-full two-branch model; `s` is the WavMamba-S ladder centred on the single shared
-branch, filed under outputs/ablation_s/ so the two studies never overwrite each
-other.
+`--study` picks the registry, each filed under its own subdirectory so the
+ladders never overwrite each other:
+
+    a  outputs/ablation/    paper ladder, centre = full two-branch WavMamba
+    s  outputs/ablation_s/  WavMamba-S,   centre = one shared branch
+    u  outputs/ablation_u/  cost study,   centre = uni-Mamba (no backward pass)
+
+Study u has six axes plus a depth axis rather than seven: with one direction
+there is no fwd/bwd merge to ablate.
 """
 import argparse
 import json
 from pathlib import Path
 
 from .ablation import (
-    ABLATIONS, ABLATIONS_S, ablation_table, build_ablation_model,
+    ABLATIONS, ABLATIONS_S, ABLATIONS_U, ablation_table, build_ablation_model,
     variant_front_end,
 )
 from .config import default_cfg
@@ -120,9 +125,11 @@ def _cmd_train(args):
         num_workers=args.num_workers)
 
 
-# Registry + output subdirectory per study. 'a' is the paper ladder; 's' is the
-# WavMamba-S ladder (see ablation.ABLATIONS_S).
-STUDIES = {'a': (ABLATIONS, 'ablation'), 's': (ABLATIONS_S, 'ablation_s')}
+# Registry + output subdirectory per study. 'a' is the paper ladder, 's' the
+# WavMamba-S ladder, 'u' the uni-Mamba cost ladder (see ablation.ABLATIONS_*).
+STUDIES = {'a': (ABLATIONS,   'ablation'),
+           's': (ABLATIONS_S, 'ablation_s'),
+           'u': (ABLATIONS_U, 'ablation_u')}
 
 
 def _parse_variants(s: str) -> list:
@@ -224,14 +231,16 @@ def main(argv=None):
     _add_common_args(pa)
     pa.add_argument('--study', default='a', choices=sorted(STUDIES),
                     help="which ladder: 'a' = paper study, centre = full "
-                         "two-branch WavMamba; 's' = WavMamba-S study, centre = "
-                         "one shared branch (default: a)")
+                         "two-branch WavMamba; 's' = WavMamba-S, centre = one "
+                         "shared branch; 'u' = cost study, centre = uni-Mamba "
+                         "(default: a)")
     # Default is the 'all' sentinel, not a name list: the registry is only known
     # once --study is parsed.
     pa.add_argument('--variants', type=_parse_variants, default=['all'],
                     help='comma-separated variant names or "all" (default: all). '
                          f'Study a: {", ".join(ABLATIONS)}. '
-                         f'Study s: {", ".join(ABLATIONS_S)}.')
+                         f'Study s: {", ".join(ABLATIONS_S)}. '
+                         f'Study u: {", ".join(ABLATIONS_U)}.')
     pa.add_argument('--seeds', type=_parse_seeds, default=(42,),
                     help='comma-separated seeds (default: 42; paper 5-seed '
                          'protocol: 0,4,8,17,42)')

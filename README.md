@@ -300,6 +300,52 @@ python -m wavmamba ablate --dataset uthar --study s --seeds 0,4,8,17,42 \
   --variants c3_split,c4_nostem,c5_uni,c5_bilstm,c6_add,c6_concat,c7_statpool,c7_mean
 ```
 
+### `--study u`: the uni-Mamba cost ladder
+
+`--study u` (registry `ABLATIONS_U`, filed under `outputs/ablation_u/`) centres on
+the single-direction backbone. It is a **cost study, not a search for a better
+model**: dropping the backward pass removes 39% of the parameters and ~30% of the
+latency at accuracy that is statistically indistinguishable from keeping it
+(NTU-Fi +0.30pp t=+0.59; UT-HAR −0.10pp t=−1.58 over the same five seeds), so this
+ladder asks what the remaining components are worth once the cheap backbone is the
+baseline. Read `u5_bimamba` in reverse: here *adding* the backward pass is the
+rung.
+
+It has **six axes plus a depth axis**, not seven. With `direction='uni'`,
+`_MambaSeqLayer` builds no `bwd` and no gate, so the fwd/bwd merge flag is inert —
+`merge='add'` and `merge='concat'` are the same model as the centre, parameter
+count and `state_dict` keys identical. The zero-init merge gate can therefore only
+be ablated in studies `a` and `s`. In its place, `u7_depth3` moves the backbone
+from two Mamba layers to three; drop-path rates come from `_dp_schedule`, which
+reproduces both shipped constants exactly (`(0.0, 0.10)` at two layers,
+`(0.0, 0.05, 0.10)` at three), so the existing rungs keep their published
+regularisation bit-for-bit. Note in any caption that a depth rung necessarily
+moves two things at once — layer count *and* the per-layer rates — since the rates
+cannot stay fixed when their number changes.
+
+Four of its rows (`centre_u`, `u2_separate`, `u5_bimamba`, `u5_bilstm`) are
+configurations an earlier study already trained, so those runs are reused rather
+than repeated.
+
+```bash
+python -m wavmamba ablate --dataset uthar --study u --seeds 0,4,8,17,42 \
+  --variants u1_raw,u3_split,u4_nostem,u6_statpool,u6_mean,u7_depth3
+```
+
+### Reuse across ladders
+
+A re-centred ladder shares rows with the ones before it, and those runs are copied
+on disk instead of re-trained — which is only sound while the two configurations
+still build the *same model*. That is not the same as carrying the same dict:
+several flags are inert depending on the others (`merge` needs a bidirectional
+Mamba, `fusion` needs more than one branch, `front_end='raw'` ignores `branch`
+entirely), and a later registry carries keys an earlier one lacks
+(`n_mamba_layers`). `_canon()` in `wavmamba/ablation.py` reduces a configuration to
+what the assembler actually reads, and every reused pair is checked with it at
+import time, so a drifting centre becomes an `ImportError` rather than a
+mislabelled column. Each copied run directory also carries a `PROVENANCE.txt`
+naming its source, since `metrics.json` records no variant name of its own.
+
 ### Kaggle notebook (companion)
 
 `notebooks/wavmamba_kaggle.ipynb` runs both datasets end-to-end on Kaggle: clone

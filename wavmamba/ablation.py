@@ -51,6 +51,31 @@ from .model import (
 # (shared branch, raw front-end).
 _SYM_KERNEL = (5, 5)
 
+# Peak drop-path rate of the sequence stack, read off the shipped schedule.
+_DP_MAMBA_MAX = max(_DP_MAMBA)
+
+
+def _dp_schedule(n_layers: int) -> tuple:
+    """Linear drop-path ramp 0 -> _DP_MAMBA_MAX over `n_layers` layers.
+
+    The depth ablation needs a schedule for a layer count the shipped constants
+    do not cover. Rather than inventing one, this states the rule the codebase
+    already follows: it reproduces BOTH shipped tuples exactly —
+    _DP_MAMBA (0.0, 0.10) at n=2 and _DP_CNN (0.0, 0.05, 0.10) at n=3 — so the
+    2-layer models keep their published regularisation bit-for-bit and the
+    3-layer rung inherits the same ramp the 3-stage CNN already uses.
+
+    Caveat for the caption: a depth rung still moves two things at once (layer
+    count AND the per-layer rates), because holding the rates fixed is not
+    possible when their number changes. Only the endpoints are invariant.
+    """
+    if n_layers < 1:
+        raise ValueError(f'n_layers must be >= 1, got {n_layers}')
+    if n_layers == 1:
+        return (0.0,)
+    step = _DP_MAMBA_MAX / (n_layers - 1)
+    return tuple(round(i * step, 10) for i in range(n_layers))
+
 
 # ─── Stem / pooling variants that are not just a flag on an existing block ────
 
@@ -181,15 +206,17 @@ class _Backbone(nn.Module):
     def __init__(self, d_model: int, n_layers: int, d_state: int,
                  backbone: str, merge: str):
         super().__init__()
-        if len(_DP_MAMBA) != n_layers:
-            raise ValueError(f'len(_DP_MAMBA)={len(_DP_MAMBA)} != n_layers={n_layers}')
+        # Drop-path rates come from the ramp rule, which reproduces the shipped
+        # _DP_MAMBA exactly at n_layers=2 (see _dp_schedule) — so this is not a
+        # behaviour change for every existing rung, it just also covers n != 2.
+        dp = _dp_schedule(n_layers)
         if backbone == 'bilstm':
-            layers = [_BiLSTMLayer(d_model, drop_path=_DP_MAMBA[i])
+            layers = [_BiLSTMLayer(d_model, drop_path=dp[i])
                       for i in range(n_layers)]
         else:
             direction = 'uni' if backbone == 'unimamba' else 'bi'
             layers = [_MambaSeqLayer(d_model, d_state=d_state,
-                                     drop_path=_DP_MAMBA[i],
+                                     drop_path=dp[i],
                                      direction=direction, merge=merge)
                       for i in range(n_layers)]
         self.layers = nn.ModuleList(layers)
@@ -409,28 +436,95 @@ ABLATIONS_S = {
 }
 
 
-# Three ABLATIONS_S rows are configurations that ABLATIONS already ran, so their
-# runs are reused (copied on disk) instead of re-trained. That is only sound
-# while the configs keep building the same model — this check makes a drifting
-# CENTER an ImportError instead of a mislabelled column.
+# ─── Registry U: centre = uni-directional Mamba, 3 layers reachable ───────────
+# A cost study, not a search for a better model: on both benchmarks dropping the
+# backward pass is statistically indistinguishable from keeping it (NTU-Fi
+# +0.30pp t=+0.59; UT-HAR -0.10pp t=-1.58) while removing 39% of the parameters,
+# so this ladder asks what the remaining components are worth once the cheaper
+# backbone is the baseline.
+#
+# SIX axes, not seven: the fwd/bwd merge axis does not exist here. With
+# direction='uni' _MambaSeqLayer builds no `bwd` and no gate, so merge='add' and
+# merge='concat' are the same model as the centre. A depth axis replaces it.
+# `merge` stays in the dict so CENTER_U + backbone='bimamba' is exactly CENTER.
+
+CENTER_U = dict(front_end='dwt', branch='shared', stem='stem',
+                backbone='unimamba', merge='gate', fusion='adaptive',
+                pool='attnstat', n_mamba_layers=2)
+
+
+def _vu(**override) -> dict:
+    """CENTER_U with one flag overridden (rejects typos in the override key)."""
+    bad = set(override) - set(CENTER_U)
+    if bad:
+        raise KeyError(f'unknown ablation flag(s) {bad}; valid: {sorted(CENTER_U)}')
+    return {**CENTER_U, **override}
+
+
+ABLATIONS_U = {
+    'centre_u':    dict(kwargs=_vu(),                    note='uni-Mamba, one shared branch, 2 layers'),
+    'u1_raw':      dict(kwargs=_vu(front_end='raw'),     note='#1 no DWT — raw amplitude'),
+    'u2_separate': dict(kwargs=_vu(branch='separate'),   note='#2 two per-subband branches + late fusion'),
+    'u3_split':    dict(kwargs=_vu(branch='split'),      note='#3 per-subband stems, one shared backbone'),
+    'u4_nostem':   dict(kwargs=_vu(stem='nostem'),       note='#4 no CNN stem/TFBlocks — DWT -> embed -> Mamba'),
+    'u5_bimamba':  dict(kwargs=_vu(backbone='bimamba'),  note='#5 bidirectional Mamba (+ zero-init merge gate)'),
+    'u5_bilstm':   dict(kwargs=_vu(backbone='bilstm'),   note='#5 BiLSTM backbone'),
+    'u6_statpool': dict(kwargs=_vu(pool='statpool'),     note='#6 unweighted [mean||std] — attention removed'),
+    'u6_mean':     dict(kwargs=_vu(pool='mean'),         note='#6 mean-pool over time'),
+    'u7_depth3':   dict(kwargs=_vu(n_mamba_layers=3),    note='#7 three Mamba layers (drop-path 0/.05/.10)'),
+}
+
+
+# ─── Reuse: rows that are configurations an earlier study already ran ──────────
+# Those runs are copied on disk instead of re-trained. Sound only while the
+# configs keep building the SAME model, so the pairs are checked at import time:
+# a drifting centre becomes an ImportError, not a mislabelled column.
+#
+# Dicts cannot be compared directly — a flag can be inert under another flag, and
+# the registries carry different key sets. _canon reduces a config to what
+# actually reaches the built model.
+
+_MODEL_DEFAULTS = dict(n_mamba_layers=2)      # AblationWavMamba's own default
+
+
+def _canon(kw: dict) -> dict:
+    """Flags reduced to the ones that change the model that gets built.
+
+    Three flags can be inert, all three visible in AblationWavMamba.__init__:
+      * front_end='raw' forces one branch and ignores `branch` (specs block);
+      * one branch means no fusion at all (`self._fusion` is None);
+      * merge only exists for a bidirectional Mamba (no bwd => no gate/proj).
+    Missing keys are filled from the model defaults so registries with different
+    key sets stay comparable.
+    """
+    c = {**_MODEL_DEFAULTS, **kw}
+    if c['front_end'] == 'raw':
+        c.pop('branch', None)
+    if c['front_end'] == 'raw' or c.get('branch') in ('shared', 'split'):
+        c.pop('fusion', None)
+    if c['backbone'] != 'bimamba':
+        c.pop('merge', None)
+    return c
+
+
 _REUSED = (
-    # (new, old, keys that do not affect the model that gets built)
-    ('center',      'a2_shared', ()),
-    ('c2_separate', 'ours',      ()),
-    # front_end='raw' forces one branch and IGNORES `branch` (see the specs block
-    # in AblationWavMamba.__init__), so these two build the same model despite
-    # differing on that key.
-    ('c1_raw',      'a1_raw',    ('branch',)),
+    # (registry, row, reuses, row) — same model, so the run is copied not re-run
+    (ABLATIONS_S, 'center',      ABLATIONS,   'a2_shared'),
+    (ABLATIONS_S, 'c2_separate', ABLATIONS,   'ours'),
+    (ABLATIONS_S, 'c1_raw',      ABLATIONS,   'a1_raw'),
+    (ABLATIONS_U, 'centre_u',    ABLATIONS_S, 'c5_uni'),
+    (ABLATIONS_U, 'u2_separate', ABLATIONS,   'a4_unimamba'),
+    (ABLATIONS_U, 'u5_bimamba',  ABLATIONS_S, 'center'),
+    (ABLATIONS_U, 'u5_bilstm',   ABLATIONS_S, 'c5_bilstm'),
 )
-for _new, _old, _skip in _REUSED:
-    _a = {k: v for k, v in ABLATIONS_S[_new]['kwargs'].items() if k not in _skip}
-    _b = {k: v for k, v in ABLATIONS[_old]['kwargs'].items() if k not in _skip}
+for _rn, _new, _ro, _old in _REUSED:
+    _a, _b = _canon(_rn[_new]['kwargs']), _canon(_ro[_old]['kwargs'])
     if _a != _b:
         raise AssertionError(
             f'{_new} must build the same model as {_old} — reused runs would be '
             f'mislabelled. Differences: '
             f'{ {k: (_a.get(k), _b.get(k)) for k in _a.keys() | _b.keys() if _a.get(k) != _b.get(k)} }')
-del _new, _old, _skip, _a, _b
+del _rn, _new, _ro, _old, _a, _b
 
 
 def build_ablation_model(variant: str, meta: dict,

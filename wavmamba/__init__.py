@@ -35,6 +35,7 @@ from .trainer import run
 from .ablation import (
     ABLATIONS,
     ABLATIONS_S,
+    ABLATIONS_U,
     AblationWavMamba,
     ablation_table,
     build_ablation_model,
@@ -44,8 +45,9 @@ from .ablation import (
 __version__ = '1.0.0'
 
 __all__ = [
-    'ABLATIONS', 'ABLATIONS_S', 'AblationWavMamba', 'CLASS_NAMES', 'DIRMAP',
-    'TrainCfg', 'WavMamba', 'ablation_table', 'bench_dirname',
-    'build_ablation_model', 'build_bench', 'build_loaders', 'default_cfg',
-    'haar_subbands', 'load_stats', 'run', 'to_maps', 'variant_front_end',
+    'ABLATIONS', 'ABLATIONS_S', 'ABLATIONS_U', 'AblationWavMamba',
+    'CLASS_NAMES', 'DIRMAP', 'TrainCfg', 'WavMamba', 'ablation_table',
+    'bench_dirname', 'build_ablation_model', 'build_bench', 'build_loaders',
+    'default_cfg', 'haar_subbands', 'load_stats', 'run', 'to_maps',
+    'variant_front_end',
 ]
