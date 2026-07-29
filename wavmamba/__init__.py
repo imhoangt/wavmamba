@@ -34,16 +34,18 @@ from .model import WavMamba
 from .trainer import run
 from .ablation import (
     ABLATIONS,
+    ABLATIONS_S,
     AblationWavMamba,
     ablation_table,
     build_ablation_model,
+    variant_front_end,
 )
 
 __version__ = '1.0.0'
 
 __all__ = [
-    'ABLATIONS', 'AblationWavMamba', 'CLASS_NAMES', 'DIRMAP', 'TrainCfg',
-    'WavMamba', 'ablation_table', 'bench_dirname', 'build_ablation_model',
-    'build_bench', 'build_loaders', 'default_cfg', 'haar_subbands',
-    'load_stats', 'run', 'to_maps',
+    'ABLATIONS', 'ABLATIONS_S', 'AblationWavMamba', 'CLASS_NAMES', 'DIRMAP',
+    'TrainCfg', 'WavMamba', 'ablation_table', 'bench_dirname',
+    'build_ablation_model', 'build_bench', 'build_loaders', 'default_cfg',
+    'haar_subbands', 'load_stats', 'run', 'to_maps', 'variant_front_end',
 ]

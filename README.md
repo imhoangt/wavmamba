@@ -62,9 +62,6 @@ wavmamba/                       repository root
 │   ├── engine.py               train/eval primitives + analytic MAC counting
 │   ├── trainer.py              run() — seed loop -> eval -> plots -> metrics.json
 │   └── ablation.py             AblationWavMamba + registry (single-variable study)
-├── tests/
-│   ├── smoke_cpu.py            CPU end-to-end smoke test (mocked Mamba)
-│   └── smoke_ablation.py       CPU ablation smoke test (all variants + ours==WavMamba)
 ├── notebooks/
 │   └── wavmamba_kaggle.ipynb   Kaggle companion notebook
 ├── README.md
@@ -240,17 +237,19 @@ inside a custom autograd Function, where operator-matching counters such as
 `fvcore` silently see nothing — about 72% of this model's MACs. `latency_*_ms` is
 measured on GPU (200 timed runs after 50 warm-ups) and is `null` on CPU.
 
-`macs_ssm_counted` is `true` only when real Mamba blocks were found and counted
-in closed form. It is `false` on a CPU run that substitutes Mamba (as the smoke
-test does), where the number covers the convolutional path only.
+`macs_ssm_counted` is `true` when the recurrent sequence core was counted — a
+real Mamba block (closed-form scan + projections) or an `nn.LSTM` backbone
+(closed-form gates, the `a4_bilstm` ablation). It is `false` only when `mamba_ssm`
+is unavailable and a Mamba model falls back to a stand-in, where the number
+covers the convolutional path only and must not be reported.
 
 ## Ablation study
 
 WavMamba ships a locked architecture, so the ablations live in a separate,
 configurable assembler (`wavmamba/ablation.py`) that reuses the same building
 blocks under swappable flags — the paper model and its reproducibility guarantee
-are untouched. Each variant changes exactly **one** component versus the paper
-configuration (`ours`):
+are untouched. Each variant changes exactly **one** component versus a centre
+configuration. `--study a` (the default) centres on the paper model, `ours`:
 
 | # | Component | Variants (`ours` in bold) |
 |---|-----------|---------------------------|
@@ -274,11 +273,32 @@ Each variant builds the bench it needs (the DWT bench, or a separate `raw_…`
 bench for `a1_raw`), trains under the fixed protocol, and is filed under
 `outputs/ablation/<dataset>/<variant>/` with its own `metrics.json`. Finished
 variants are skipped, so the sweep is resumable. After the sweep the command
-prints a markdown table (acc, macro-F1, params, MACs per row); regenerate it any
-time with `ablation_table('uthar')`, which rediscovers runs by disk-glob so it
-survives a kernel restart. No parameter matching is applied — params and MACs
-are reported as table columns instead, so the compute difference of each variant
-is explicit.
+prints a markdown table (acc ± std, macro-F1 ± std, params, MACs, latency per
+row); regenerate it any time with `ablation_table('uthar')`, which rediscovers
+runs by disk-glob so it survives a kernel restart. No parameter matching is
+applied — params and MACs are reported as table columns instead, so the compute
+difference of each variant is explicit.
+
+### `--study s`: the WavMamba-S ladder
+
+`--study s` (registry `ABLATIONS_S`, filed under `outputs/ablation_s/`) re-runs
+the same seven axes centred on the single-shared-branch variant, reported as the
+efficient configuration. Two axes are only expressible from that centre: with one
+branch, `c1_raw` differs from the centre by the DWT **alone** (from `ours` it
+also changes the branch count), and `c3_split` (per-subband stems, one shared
+backbone) separates specialised kernels from a duplicated backbone. `c7_statpool`
+drops the pooling attention while keeping the `[mean ‖ std]` statistic, splitting
+the two changes that `a7_mean` makes at once.
+
+Three of its rows (`center`, `c1_raw`, `c2_separate`) are configurations study a
+already trained, so those runs are reused rather than repeated; a module-level
+check in `ablation.py` turns a drifting centre into an `ImportError` instead of a
+mislabelled column.
+
+```bash
+python -m wavmamba ablate --dataset uthar --study s --seeds 0,4,8,17,42 \
+  --variants c3_split,c4_nostem,c5_uni,c5_bilstm,c6_add,c6_concat,c7_statpool,c7_mean
+```
 
 ### Kaggle notebook (companion)
 

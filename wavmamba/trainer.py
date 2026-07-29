@@ -293,7 +293,7 @@ def _summarize(per_seed_results, model, device, meta, total_time):
         'macs_M':              macs['total_M'],
         'flops_M':             macs['flops_M'],
         'macs_breakdown_M':    macs['breakdown_M'],
-        # False => the run used the CPU test double, so macs_M excludes the SSM.
+        # False => the SSM kernels were unavailable, so macs_M excludes the SSM.
         'macs_ssm_counted':    macs['ssm_counted'],
         'macs_note':           macs['note'],
         'latency_mean_ms':     lat_mean,

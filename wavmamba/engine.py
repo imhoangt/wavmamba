@@ -130,7 +130,7 @@ def _is_mamba(module: nn.Module) -> bool:
     """A real mamba_ssm.Mamba block, identified by the attributes we need.
 
     Duck-typed rather than isinstance-checked so the counter also works when
-    mamba_ssm is unavailable (e.g. the CPU test double), in which case the
+    mamba_ssm is unavailable (a stand-in Mamba on CPU), in which case the
     block's own layers are counted by the generic hooks instead.
     """
     return all(hasattr(module, a) for a in
@@ -288,18 +288,21 @@ def wavmamba_macs(model: nn.Module, input_shape) -> dict:
         It is True for a real Mamba block (closed-form scan + projections) and
         for an nn.LSTM backbone (closed-form gates — the a4_bilstm ablation,
         which runs natively on CPU). It is False only when neither is found —
-        i.e. a Mamba model with the CPU test double swapped in, whose total is
-        then missing the state-space core. Do not report an ssm_counted=False run.
+        i.e. a Mamba model whose CUDA kernels were unavailable and a stand-in
+        was swapped in, whose total is then missing the state-space core. Do
+        not report an ssm_counted=False run.
     """
     device = next(model.parameters()).device
     x = torch.randn(1, *tuple(input_shape), device=device)
     total, tally = count_macs(model, (x,))
     # The sequence core is counted iff a Mamba block (mamba.*) or an LSTM (lstm)
-    # term is present. Neither => a Mamba model ran under the CPU test double.
+    # term is present. Neither => a Mamba model ran with its CUDA kernels
+    # unavailable and a stand-in swapped in.
     ssm_counted = any(k.startswith('mamba.') for k in tally) or ('lstm' in tally)
     note = CONVENTION if ssm_counted else (
-        'INCOMPLETE — no mamba_ssm.Mamba block was found (CPU test double in '
-        'use), so the state-space core is NOT included. Do not report. '
+        'INCOMPLETE — no mamba_ssm.Mamba block was found (its CUDA kernels were '
+        'unavailable and a stand-in was swapped in), so the state-space core is '
+        'NOT included. Do not report. '
         + CONVENTION
     )
     return {

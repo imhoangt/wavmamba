@@ -14,17 +14,23 @@ resolves the bench directory with the same bench_dirname() helper the builder
 uses, so a run can never be filed under a tag that disagrees with its data.
 
 `ablate` runs the single-variable ablation study: for each variant it builds
-the bench that variant needs (the DWT bench, or the raw bench for a1_raw),
-trains an AblationWavMamba under the same protocol, and files each result under
-outputs/ablation/<dataset>/<variant>/. Finished runs are skipped, so the sweep
-is resumable; `ablation_table()` then aggregates them by disk-glob.
+the bench that variant needs (the DWT bench, or the raw bench for the no-DWT
+rung), trains an AblationWavMamba under the same protocol, and files each result
+under outputs/<subdir>/<dataset>/<variant>/. Finished runs are skipped, so the
+sweep is resumable; `ablation_table()` then aggregates them by disk-glob.
+
+`--study` picks the registry: `a` (default) is the paper ladder centred on the
+full two-branch model; `s` is the WavMamba-S ladder centred on the single shared
+branch, filed under outputs/ablation_s/ so the two studies never overwrite each
+other.
 """
 import argparse
 import json
 from pathlib import Path
 
 from .ablation import (
-    ABLATIONS, ablation_table, build_ablation_model, variant_front_end,
+    ABLATIONS, ABLATIONS_S, ablation_table, build_ablation_model,
+    variant_front_end,
 )
 from .config import default_cfg
 from .data import DATA_ROOT, DIRMAP, bench_dirname, build_bench
@@ -114,17 +120,22 @@ def _cmd_train(args):
         num_workers=args.num_workers)
 
 
+# Registry + output subdirectory per study. 'a' is the paper ladder; 's' is the
+# WavMamba-S ladder (see ablation.ABLATIONS_S).
+STUDIES = {'a': (ABLATIONS, 'ablation'), 's': (ABLATIONS_S, 'ablation_s')}
+
+
 def _parse_variants(s: str) -> list:
-    """'all' -> every registry variant; 'ours,a5_add' -> that subset (order kept)."""
+    """'all' -> sentinel for every variant; 'ours,a5_add' -> that subset.
+
+    Names cannot be validated here: argparse resolves `type=` before --study is
+    known, so which registry applies is not yet decided. _cmd_ablate validates
+    once it has the registry.
+    """
     s = str(s).replace(' ', '')
     if s in ('', 'all'):
-        return list(ABLATIONS)
-    want = [v for v in s.split(',') if v]
-    bad = [v for v in want if v not in ABLATIONS]
-    if bad:
-        raise argparse.ArgumentTypeError(
-            f'unknown variant(s) {bad}; choose from {list(ABLATIONS)} or "all"')
-    return want
+        return ['all']
+    return [v for v in s.split(',') if v]
 
 
 def _cmd_ablate(args):
@@ -133,14 +144,27 @@ def _cmd_ablate(args):
     overrides = {k: v for k, v in (('num_epochs', args.num_epochs),
                                    ('batch_size', args.batch_size),
                                    ('lr', args.lr)) if v is not None}
+    registry, subdir = STUDIES[args.study]
 
-    for variant in args.variants:
-        fe = variant_front_end(variant)
+    variants = list(registry) if args.variants == ['all'] else args.variants
+    bad = [v for v in variants if v not in registry]
+    if bad:
+        raise SystemExit(
+            f'unknown variant(s) {bad} for --study {args.study}; '
+            f'choose from {list(registry)} or "all"')
+
+    # One directory for this study's runs: each variant is a subdirectory, and
+    # the same path is handed to ablation_table, so the table can only ever
+    # aggregate the runs this sweep just wrote.
+    study_base = out_root / 'outputs' / subdir / args.dataset
+
+    for variant in variants:
+        fe = variant_front_end(variant, registry)
         # merge_val only exists for UT-HAR; the raw ablation gets the raw bench.
         mv  = args.merge_val and args.dataset == 'uthar'
         tag = bench_dirname(args.prenorm, args.z_gran, mv, fe)
         bench_dir = out_root / DIRMAP[args.dataset] / 'bench' / tag
-        out_dir   = out_root / 'outputs' / 'ablation' / args.dataset / variant
+        out_dir   = study_base / variant
 
         # Resume: skip a variant whose metrics.json already lists every seed.
         metrics_path = out_dir / 'metrics.json'
@@ -164,9 +188,10 @@ def _cmd_ablate(args):
             output_dir=out_dir,
             cfg=cfg,
             num_workers=args.num_workers,
-            model_builder=lambda v=variant, m=meta: build_ablation_model(v, m))
+            model_builder=lambda v=variant, m=meta: build_ablation_model(
+                v, m, registry))
 
-    ablation_table(args.dataset, out_root=args.out_root)
+    ablation_table(args.dataset, base=study_base, registry=registry)
 
 
 def main(argv=None):
@@ -197,9 +222,16 @@ def main(argv=None):
 
     pa = sub.add_parser('ablate', help='run the single-variable ablation sweep')
     _add_common_args(pa)
-    pa.add_argument('--variants', type=_parse_variants, default=list(ABLATIONS),
+    pa.add_argument('--study', default='a', choices=sorted(STUDIES),
+                    help="which ladder: 'a' = paper study, centre = full "
+                         "two-branch WavMamba; 's' = WavMamba-S study, centre = "
+                         "one shared branch (default: a)")
+    # Default is the 'all' sentinel, not a name list: the registry is only known
+    # once --study is parsed.
+    pa.add_argument('--variants', type=_parse_variants, default=['all'],
                     help='comma-separated variant names or "all" (default: all). '
-                         f'Choices: {", ".join(ABLATIONS)}')
+                         f'Study a: {", ".join(ABLATIONS)}. '
+                         f'Study s: {", ".join(ABLATIONS_S)}.')
     pa.add_argument('--seeds', type=_parse_seeds, default=(42,),
                     help='comma-separated seeds (default: 42; paper 5-seed '
                          'protocol: 0,4,8,17,42)')

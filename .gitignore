@@ -11,17 +11,15 @@ env/
 
 # Build outputs (bench arrays, trained models, metrics, plots)
 outputs/
+# The code writes `outputs/`, but the unpacked Kaggle archive lands in
+# `output/` (singular) — 240M of runs, so ignore that spelling too.
+/output/
 bench/
 *.npy
 *.npz
 *.pt
 *.pth
 *.csv
-
-# Test scratch dirs (fixtures + runs created by tests/smoke_cpu.py + smoke_ablation.py)
-tests/_tmp*/
-tests/_cli*/
-tests/_e2e_tmp/
 
 # Packaging / generated docs
 build/
@@ -34,7 +32,7 @@ UT_HAR/
 NTU-Fi_HAR/
 
 # Reference papers (third-party PDFs — not redistributable)
-paper/
+/paper/
 
 # OS / editor
 .DS_Store
