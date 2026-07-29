@@ -323,13 +323,29 @@ regularisation bit-for-bit. Note in any caption that a depth rung necessarily
 moves two things at once — layer count *and* the per-layer rates — since the rates
 cannot stay fixed when their number changes.
 
+Axis #5 is a full 2×2 over model family × direction, so neither variable moves
+alone by accident:
+
+|      | Mamba          | LSTM           |
+|------|----------------|----------------|
+| uni  | `centre_u`     | `u5_unilstm`   |
+| bi   | `u5_bimamba`   | `u5_bilstm`    |
+
+From a uni-Mamba centre, plain `bilstm` would change family *and* direction at
+once; `u5_unilstm` (`backbone='unilstm'`) closes that gap. Watch the direction of
+the cost, which is the opposite of the Mamba pair: keeping the output at `d_model`
+forces a one-directional LSTM to `LSTM(d → d)` where the bidirectional one uses
+`LSTM(d → d/2)` per direction, and `W_hh` grows quadratically in the hidden size —
+so `u5_unilstm` spends **more** parameters than `u5_bilstm` (+8,192 per layer),
+while `unimamba` *saves* 47,040 per layer versus `bimamba`.
+
 Four of its rows (`centre_u`, `u2_separate`, `u5_bimamba`, `u5_bilstm`) are
 configurations an earlier study already trained, so those runs are reused rather
 than repeated.
 
 ```bash
 python -m wavmamba ablate --dataset uthar --study u --seeds 0,4,8,17,42 \
-  --variants u1_raw,u3_split,u4_nostem,u6_statpool,u6_mean,u7_depth3
+  --variants u1_raw,u3_split,u4_nostem,u5_unilstm,u6_statpool,u6_mean,u7_depth3
 ```
 
 ### Reuse across ladders

@@ -14,7 +14,8 @@ configuration. See `ABLATIONS` / `ABLATIONS_S` for the two registries.
     branch    : 'separate' (per-subband, ours)    | 'shared' (one branch)
                 | 'split' (one branch, per-subband stems)
     stem      : 'stem' (SubbandStem+3xTFBlock, ours) | 'nostem' (embed straight)
-    backbone  : 'bimamba' (ours) | 'unimamba' | 'bilstm'
+    backbone  : 'bimamba' (ours) | 'unimamba' | 'bilstm' | 'unilstm'
+                (family x direction, so neither variable moves alone by accident)
     merge     : 'gate' (per-channel zero-init, ours) | 'add' | 'concat'
     fusion    : 'adaptive' (softmax gate, ours) | 'mean' | 'concat'
     pool      : 'attnstat' (ECAPA, ours) | 'statpool' (no attention) | 'mean'
@@ -177,20 +178,29 @@ class _MambaSeqLayer(nn.Module):
         return x + self.dp(y)
 
 
-class _BiLSTMLayer(nn.Module):
-    """Residual bidirectional-LSTM layer, drop-in for a Mamba layer.
+class _LSTMLayer(nn.Module):
+    """Residual LSTM layer, drop-in for a Mamba layer. Output is d_model either way.
 
-    LSTM(d_model -> d_model//2, bidirectional) concatenates the two directions
-    back to d_model, so no output projection is needed.
+    bi : LSTM(d_model -> d_model//2, bidirectional) — the two directions are
+         concatenated back to d_model, so no output projection is needed.
+    uni: LSTM(d_model -> d_model), one direction, same output width.
+
+    Note the uni variant is the BIGGER one (33,280 vs 25,088 params at d=64):
+    holding the output at d_model forces the hidden state to d instead of d/2,
+    and W_hh grows quadratically in it. So 'unilstm' vs 'bilstm' isolates
+    direction while spending MORE parameters — the opposite of the uni-vs-bi
+    Mamba pair, where dropping a direction removes a whole second block.
     """
 
-    def __init__(self, d_model: int, drop_path: float = 0.0):
+    def __init__(self, d_model: int, drop_path: float = 0.0,
+                 direction: str = 'bi'):
         super().__init__()
-        if d_model % 2 != 0:
+        bidir = (direction == 'bi')
+        if bidir and d_model % 2 != 0:
             raise ValueError(f'BiLSTM needs an even d_model; got {d_model}')
         self.norm = RMSNorm(d_model)
-        self.lstm = nn.LSTM(d_model, d_model // 2, batch_first=True,
-                            bidirectional=True)
+        self.lstm = nn.LSTM(d_model, d_model // 2 if bidir else d_model,
+                            batch_first=True, bidirectional=bidir)
         self.dp = DropPath(drop_path)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -210,11 +220,12 @@ class _Backbone(nn.Module):
         # _DP_MAMBA exactly at n_layers=2 (see _dp_schedule) — so this is not a
         # behaviour change for every existing rung, it just also covers n != 2.
         dp = _dp_schedule(n_layers)
-        if backbone == 'bilstm':
-            layers = [_BiLSTMLayer(d_model, drop_path=dp[i])
+        # 'uni' prefix on either family means one direction only.
+        direction = 'uni' if backbone in ('unimamba', 'unilstm') else 'bi'
+        if backbone in ('bilstm', 'unilstm'):
+            layers = [_LSTMLayer(d_model, drop_path=dp[i], direction=direction)
                       for i in range(n_layers)]
         else:
-            direction = 'uni' if backbone == 'unimamba' else 'bi'
             layers = [_MambaSeqLayer(d_model, d_state=d_state,
                                      drop_path=dp[i],
                                      direction=direction, merge=merge)
@@ -292,7 +303,8 @@ class AblationWavMamba(nn.Module):
                 ('front_end', front_end, ('dwt', 'raw')),
                 ('branch',    branch,    ('separate', 'shared', 'split')),
                 ('stem',      stem,      ('stem', 'nostem')),
-                ('backbone',  backbone,  ('bimamba', 'unimamba', 'bilstm')),
+                ('backbone',  backbone,  ('bimamba', 'unimamba', 'bilstm',
+                                          'unilstm')),
                 ('merge',     merge,     ('gate', 'add', 'concat')),
                 ('fusion',    fusion,    ('adaptive', 'mean', 'concat')),
                 ('pool',      pool,      ('attnstat', 'statpool', 'mean'))):
@@ -469,6 +481,7 @@ ABLATIONS_U = {
     'u4_nostem':   dict(kwargs=_vu(stem='nostem'),       note='#4 no CNN stem/TFBlocks — DWT -> embed -> Mamba'),
     'u5_bimamba':  dict(kwargs=_vu(backbone='bimamba'),  note='#5 bidirectional Mamba (+ zero-init merge gate)'),
     'u5_bilstm':   dict(kwargs=_vu(backbone='bilstm'),   note='#5 BiLSTM backbone'),
+    'u5_unilstm':  dict(kwargs=_vu(backbone='unilstm'),  note='#5 uni-LSTM backbone (family x direction 2x2)'),
     'u6_statpool': dict(kwargs=_vu(pool='statpool'),     note='#6 unweighted [mean||std] — attention removed'),
     'u6_mean':     dict(kwargs=_vu(pool='mean'),         note='#6 mean-pool over time'),
     'u7_depth3':   dict(kwargs=_vu(n_mamba_layers=3),    note='#7 three Mamba layers (drop-path 0/.05/.10)'),
